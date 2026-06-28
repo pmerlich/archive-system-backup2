@@ -1,0 +1,440 @@
+// schema.prisma — מקור האמת היחיד למבנה מסד הנתונים.
+// כל הטבלאות והקשרים מוגדרים כאן; שאר הקוד משתמש בלקוח ש-Prisma מייצר מהקובץ הזה.
+// עיקרון: לכל טבלה יש תאריך יצירה/עדכון, ולרוב גם מחיקה רכה (deletedAt) — אף פעם לא מוחקים באמת.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// משתמשי המערכת
+model User {
+  id          String       @id @default(uuid())
+  email            String       @unique
+  name             String
+  passwordHash     String
+  twoFactorEnabled Boolean      @default(false)
+  otpCodeHash      String?
+  otpExpiresAt     DateTime?
+  otpAttempts      Int          @default(0) // ניסיונות OTP שגויים — לחסימת ניחוש בכוח
+  scopedView       Boolean      @default(false) // משתמש מוגבל-טווח: רואה רק קבצים שהוענקו לו (שלב 3.9)
+  roleId           String
+  role        Role         @relation(fields: [roleId], references: [id])
+  auditEvents AuditEvent[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  deletedAt   DateTime? // מחיקה רכה — לא מוחקים היסטוריית משתמש
+}
+
+/// תפקידי הרשאה (בעלים, מנהל מערכת, מנהל תוכן, עורך, צופה וכו')
+model Role {
+  id          String   @id @default(uuid())
+  key         String?  @unique // מזהה יציב באנגלית (owner / system_admin ...) — נקבע בזריעה
+  name        String   @unique // שם להצגה בעברית
+  description String? // תיאור קצר של מה התפקיד מאפשר
+  permissions String[] @default([]) // רשימת מפתחות הרשאה (capabilities)
+  isOwner     Boolean  @default(false) // בעלים — עוקף את כל בדיקות ההרשאה
+  isSystem    Boolean  @default(false) // תפקיד מובנה של המערכת — לא נמחק
+  users       User[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+/// תיקיות — המיקום הלוגי של הקובץ. תומך בתת-תיקיות (הפניה עצמית).
+model Folder {
+  id        String    @id @default(uuid())
+  name      String
+  parentId  String?
+  parent    Folder?   @relation("FolderTree", fields: [parentId], references: [id])
+  children  Folder[]  @relation("FolderTree")
+  files     File[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+}
+
+/// קבצים — רשומת המקור. הקובץ הפיזי נשמר בנפרד; כאן המידע עליו.
+model File {
+  id        String    @id @default(uuid())
+  name      String
+  hash      String // טביעת אצבע (BLAKE3 / SHA-256) לזיהוי כפילויות מלאות
+  sizeBytes BigInt
+  mimeType  String?
+  uploadedById String? // מי העלה/ייבא (מזהה משתמש) — לסינון "מי שהעלה"
+  source    String    @default("upload") // upload = העלאה ידנית | import = ייבוא מדיסק
+  backedUp  Boolean   @default(false) // האם קיים גיבוי פיזי (יתעדכן בשלב הגיבוי)
+  folderId  String?
+  folder    Folder?   @relation(fields: [folderId], references: [id])
+  tags      FileTag[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@index([hash])
+  @@index([createdAt]) // מיון/עימוד ברירת מחדל (חדש→ישן)
+  @@index([name]) // מיון לפי שם ותמיכה בחיפוש
+  @@index([folderId]) // סינון מהיר לפי תיקייה
+  @@index([mimeType]) // סינון לפי סוג
+  @@index([sizeBytes]) // סינון/מיון לפי גודל
+  @@index([uploadedById]) // סינון לפי מי שהעלה
+  @@index([source]) // סינון לפי מקור (העלאה/ייבוא)
+  @@index([backedUp]) // סינון לפי קיום גיבוי
+}
+
+/// תגיות — היררכיות (כמו תיקיות): כל תגית יכולה להיות תת-תגית של אחרת, ללא הגבלת עומק.
+/// הייחודיות היא לפי (אב, שם) — שתי תגיות לא יכולות לשאת אותו שם תחת אותו אב.
+model Tag {
+  id          String      @id @default(uuid())
+  name        String
+  parentId    String? // תגית-אב (הפניה עצמית) — null = תגית שורש
+  parent      Tag?        @relation("TagTree", fields: [parentId], references: [id])
+  children    Tag[]       @relation("TagTree")
+  type        String      @default("regular") // regular | project | person | status | backup | edit ...
+  sensitivity Sensitivity @default(NONE)
+  files       FileTag[]
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([parentId, name])
+}
+
+/// טבלת קישור בין קבצים לתגיות (קובץ אחד יכול לקבל תגיות רבות).
+model FileTag {
+  fileId String
+  tagId  String
+  file   File   @relation(fields: [fileId], references: [id])
+  tag    Tag    @relation(fields: [tagId], references: [id])
+
+  @@id([fileId, tagId])
+}
+
+/// לוג מלא — Append-Only. כל פעולה במערכת נרשמת כאן ואינה נמחקת/נערכת.
+model AuditEvent {
+  id         String   @id @default(uuid())
+  action     String
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id])
+  targetType String? // file | folder | tag | user | disk | link
+  targetId   String?
+  details    Json?
+  ip         String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([targetType, targetId])
+}
+
+/// רמות רגישות — שדה נשלט שישפיע בהמשך על הרשאות וסימני מים.
+enum Sensitivity {
+  NONE
+  LOW
+  MEDIUM
+  HIGH
+}
+
+/// עבודת ייבוא מדיסק (שלב 1.7). "סריקה בלבד" אוספת ומשווה למאגר; "ייבוא" מעתיק קבצים חדשים בלבד.
+/// המקור קדוש — קוראים בלבד, אף פעם לא משנים/מוחקים בדיסק המקור. בטוח-לחזרה (אפשר להריץ שוב בלי נזק).
+model ImportJob {
+  id             String       @id @default(uuid())
+  label          String // שם הדיסק/האצווה לזיהוי
+  sourcePath     String // הנתיב שנסרק (נגיש לשרת לקריאה בלבד)
+  status         String       @default("scanning") // scanning|scanned|importing|completed|failed
+  targetFolderId String? // התיקייה שאליה נכנסים קבצים חדשים (נוצרת בעת הייבוא)
+  totalFiles     Int          @default(0)
+  totalBytes     BigInt       @default(0)
+  hashedFiles    Int          @default(0)
+  newFiles       Int          @default(0)
+  newBytes       BigInt       @default(0)
+  duplicateFiles Int          @default(0)
+  importedFiles  Int          @default(0)
+  importedBytes  BigInt       @default(0)
+  errorFiles     Int          @default(0)
+  createdById    String?
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  items          ImportItem[]
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+}
+
+/// פריט ייבוא — שורה ב-Manifest: קובץ אחד שנמצא בדיסק, מצבו, ולאיזה File במאגר הוא מופה.
+model ImportItem {
+  id           String    @id @default(uuid())
+  jobId        String
+  job          ImportJob @relation(fields: [jobId], references: [id])
+  relativePath String // הנתיב בתוך הדיסק (מפת מיקום)
+  name         String
+  sizeBytes    BigInt    @default(0)
+  hash         String? // נחשב בשלב הסריקה
+  status       String    @default("pending") // pending|new|duplicate|imported|error
+  fileId       String? // ה-File שאליו ממופה (חדש שנוצר, או קיים שזוהה ככפילות)
+  error        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([jobId, status])
+}
+
+/// אוסף חכם (שלב 2.3) — שמירת תנאי סינון בעלי שם (FileQuery כ-JSON). שומר תנאים בלבד, לא קבצים,
+/// ולכן התצוגה מתעדכנת אוטומטית מול המאגר. רק היוצר (או הבעלים) רשאי לערוך/למחוק.
+model SmartCollection {
+  id          String    @id @default(uuid())
+  name        String
+  filters     Json // תנאי הסינון: q, folderId, tagIds, excludeTagIds, mimeTypes, ext, טווחי גודל/תאריך, source, duplicate, backedUp, sort, order
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([deletedAt])
+}
+
+/// הפעלת צפייה מוגנת (שלב 3.1) — נוצרת בכל פתיחת קובץ לצפייה.
+/// הצפייה מוגשת כ"גרסת צפייה" נגזרת (לא המקור), עם טוקן קצר-מועד שנבדק בכל בקשה.
+/// השדות מכינים גם את שלב 3.4 (ביטול/הגבלה) ואת שלב 3.6 (לוג צפיות). אין קשר Prisma לקבצים/משתמשים
+/// (כמו ImportItem) כדי שהמיגרציה תהיה תוספתית בלבד — שמירת fileId/userId כמזהים מאונדקסים.
+model ViewSession {
+  id         String    @id @default(uuid())
+  fileId     String // הקובץ שנצפה
+  userId     String // מי צופה
+  kind       String // image | pdf | video | audio | text | unsupported
+  pages      Int       @default(0) // מספר עמודים (ל-PDF)
+  ip         String? // כתובת IP של הצופה (ללוג צפיות)
+  userAgent  String? // דפדפן/מכשיר (ללוג צפיות)
+  expiresAt  DateTime // חלון הצפייה — אחריו ההפעלה לא תקפה
+  revokedAt  DateTime? // ביטול מיידי (שלב 3.4) — אם מולא, ההפעלה נחסמת
+  lastUsedAt DateTime? // מתי הוגשה גרסת צפייה לאחרונה
+  viewCount  Int       @default(0) // כמה בקשות צפייה הוגשו בהפעלה זו
+  restrictionId String?    // אם ההפעלה נפתחה תחת הגבלת צפייה (שלב 3.4) — לבדיקה חוזרת/ביטול מיידי
+  createdAt  DateTime  @default(now())
+
+  @@index([fileId])
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+/// תבנית סימן מים (שלב 3.2) — מגדירה מה נצרב על גרסת הצפייה. שדה `text` תומך במשתנים אישיים
+/// שמוחלפים בזמן הצפייה: {name} {email} {datetime} {date} {time} {viewid} {ip}.
+/// רק תבנית אחת יכולה להיות פעילה (`isActive`) — היא זו שנצרבת בכל צפייה מוגנת.
+model WatermarkTemplate {
+  id          String    @id @default(uuid())
+  name        String
+  text        String    @default("{email} · {datetime}") // טקסט עם משתנים אישיים
+  fontSize    Int       @default(28)
+  color       String    @default("#ffffff") // צבע hex
+  opacity     Float     @default(0.30) // 0..1
+  position    String    @default("tiled") // tiled | center | bottom-right
+  angle       Int       @default(30) // זווית במעלות (tiled/center)
+  motion      Boolean   @default(false) // וידאו — סימן מים נע
+  isActive    Boolean   @default(false) // התבנית הפעילה שנצרבת בצפייה (אחת בלבד)
+  // ── שלב 3.8 (סימני מים גמישים): כמה תבניות פעילות יחד, לוגו, עיצוב, וטווח-החלה ──
+  enabled           Boolean  @default(false) // פעילה? (כמה יכולות להיות פעילות יחד — שכבות)
+  priority          Int      @default(0) // סדר שכבות (קטן→גדול = תחתון→עליון)
+  kind              String   @default("text") // text | image (לוגו)
+  imagePath         String? // נתיב קובץ הלוגו (kind=image)
+  imageScale        Float    @default(0.25) // גודל הלוגו כשבר מהצד הקצר
+  outline           Boolean  @default(false) // קו מתאר/צל לטקסט (קריאוּת)
+  // [שינוי 2026-06-25] גמישות מלאה: מרחק בין חזרות, תנועה (ציר/כיוון/מהירות), והבהוב בווידאו
+  tileGap           Int      @default(28)    // מרחק בפיקסלים בין חזרות כש-position=tiled
+  motionAxis        String   @default("x")   // ציר התנועה בווידאו: x=אופקי | y=אנכי
+  motionDir         Int      @default(1)     // כיוון התנועה: 1 או -1
+  motionSpeed       Int      @default(120)   // מהירות התנועה בפיקסלים לשנייה
+  blink             Boolean  @default(false) // הבהוב בווידאו (מופיע לסירוגין)
+  blinkInterval     Float    @default(5)     // מחזור ההבהוב בשניות (כל כמה שניות)
+  blinkOn           Float    @default(1.5)   // משך ההופעה בכל מחזור (שניות)
+  folderIds         String[] @default([]) // טווח: תיקיות (ריק = הכול)
+  tagIds            String[] @default([]) // טווח: תגיות
+  fileIds           String[] @default([]) // טווח: קבצים ספציפיים (סימן מים לקובץ בודד)
+  mimeTypes         String[] @default([]) // טווח: סוגי קובץ
+  sensitivities     String[] @default([]) // טווח: רמות רגישות
+  includeSubfolders Boolean  @default(true)
+  includeSubtags    Boolean  @default(true)
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([isActive])
+  @@index([deletedAt])
+}
+
+/// מכשיר מאושר (שלב 3.3) — Archive Reader מייצר מזהה מקומי (deviceId) ושומר אותו אצלו.
+/// כניסה מה-Reader דורשת שהמכשיר אושר (approved). צפייה בתוכן רגיש מתאפשרת רק ממכשיר מאושר.
+model Device {
+  id         String    @id @default(uuid())
+  deviceId   String // מזהה שנוצר ב-Reader ונשמר מקומית (לא ה-cache שנמחק)
+  name       String    @default("Archive Reader")
+  userId     String // המשתמש שאליו שייך המכשיר
+  approved   Boolean   @default(false)
+  lastSeenAt DateTime?
+  revokedAt  DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([userId, deviceId])
+  @@index([userId])
+}
+
+/// הגבלת צפייה (שלב 3.4) — מגבילה גישה לקובץ לפי מכשיר / חלון זמן / מספר צפיות, עם ביטול מיידי.
+/// אם לקובץ יש הגבלה פעילה אחת או יותר — צפייה מתאפשרת רק למי שעומד בתנאי אחת מהן (רשימת-היתר).
+/// אין הגבלה פעילה = התנהגות רגילה (לפי הרשאות + חסימת תוכן רגיש). ללא קשרי Prisma (מזהים מאונדקסים) — מיגרציה תוספתית.
+model ViewRestriction {
+  id          String    @id @default(uuid())
+  fileId      String // הקובץ המוגבל
+  userId      String? // null = חל על כל המשתמשים; אחרת — רק על המשתמש הזה
+  deviceId    String? // null = כל מכשיר; אחרת — נעול ל-deviceId ספציפי של Reader מאושר
+  expiresAt   DateTime? // null = ללא תפוגה; אחרת — חסום אחרי הזמן הזה
+  maxViews    Int? // null = ללא הגבלת כמות; אחרת — מספר פתיחות מרבי
+  viewsUsed   Int       @default(0) // כמה פתיחות נוצלו עד כה
+  active      Boolean   @default(true) // ביטול מיידי = false
+  note        String? // הערה חופשית למנהל
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  revokedAt   DateTime?
+  revokedById String?
+
+  @@index([fileId])
+  @@index([userId])
+  @@index([active])
+}
+
+/// קישור צפייה חיצוני (שלב 3.5) — מאפשר לאדם מחוץ למערכת לצפות בקובץ בתנאים מבוקרים, בלי חשבון ובלי הורדת המקור.
+/// ה-URL מכיל `token` אקראי וארוך (לא את מזהה הקובץ). כל פתיחה יוצרת ShareSession, וכל התנאים נאכפים בשרת.
+model ShareLink {
+  id              String    @id @default(uuid())
+  token           String    @unique // הסוד שב-URL (אקראי, ארוך)
+  fileId          String
+  label           String? // שם לזיהוי השיתוף
+  email           String? // הגבלה למייל מסוים (null = כל מייל)
+  requireOtp      Boolean   @default(false) // קוד חד-פעמי למייל
+  requireApproval Boolean   @default(false) // אישור ידני של מנהל לפני הצפייה הראשונה
+  maxViews        Int? // מספר צפיות מרבי (null = ללא הגבלה)
+  viewsUsed       Int       @default(0)
+  expiresAt       DateTime? // תפוגה (null = ללא)
+  singleDevice    Boolean   @default(false) // נעילה למכשיר הראשון שפותח
+  boundDeviceKey  String? // המכשיר שאליו ננעל — נקבע בפתיחה הראשונה
+  ipBlock         String? // כתובות IP חסומות (מופרדות בפסיק; ערך שמסתיים בנקודה = חסימת קידומת)
+  israelOnly      Boolean   @default(false) // חסימה מחוץ לישראל (לפי מדינת ה-IP)
+  watermark       Boolean   @default(true) // צריבת סימן מים אישי
+  watermarkText   String? // טקסט סימן מים מותאם לשיתוף זה (למשל שם הנמען)
+  allowDownload   Boolean   @default(false) // איסור הורדת מקור (ברירת מחדל: אין הורדה כלל)
+  active          Boolean   @default(true) // ביטול מיידי = false
+  createdById     String?
+  revokedAt       DateTime?
+  revokedById     String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([fileId])
+  @@index([active])
+}
+
+/// הפעלת צפייה דרך קישור חיצוני (שלב 3.5) — נוצרת בכל פתיחת קישור ע"י אורח. שומרת אימות מייל/קוד, מכשיר, IP ומדינה.
+model ShareSession {
+  id           String    @id @default(uuid())
+  linkId       String
+  fileId       String
+  deviceKey    String? // מזהה דפדפן (לנעילת מכשיר)
+  email        String? // המייל שאומת
+  otpCodeHash  String?
+  otpExpiresAt DateTime?
+  otpAttempts  Int       @default(0)
+  verified     Boolean   @default(false) // עבר אימות מייל/קוד (אם נדרש)
+  approved     Boolean   @default(false) // אושר ידנית ע"י מנהל (אם נדרש)
+  ip           String?
+  country      String? // מדינת ה-IP שזוהתה בפתיחה
+  userAgent    String?
+  expiresAt    DateTime // חלון ההפעלה
+  revokedAt    DateTime?
+  viewCount    Int       @default(0)
+  createdAt    DateTime  @default(now())
+  lastUsedAt   DateTime?
+
+  @@index([linkId])
+}
+
+/// כלל הרשאת גישה (שלב 3.9) — מגביל או מעניק גישת צפייה לפי טווח (תיקיות/תגיות/קבצים/סוג/רגישות), עם תנאים.
+/// type=grant → המשתמשים ב-userIds רשאים לצפות בטווח (גם אם הם "מוגבלי-טווח"). type=restrict → צפייה בטווח חסומה
+/// אלא אם מתקיים תנאי (מכשיר/זמן); userIds ריק = חל על כולם. ללא קשרי Prisma (מזהים מאונדקסים) — מיגרציה תוספתית.
+model AccessRule {
+  id                String    @id @default(uuid())
+  type              String // grant | restrict
+  label             String?
+  folderIds         String[]  @default([])
+  tagIds            String[]  @default([])
+  fileIds           String[]  @default([])
+  mimeTypes         String[]  @default([])
+  sensitivities     String[]  @default([])
+  includeSubfolders Boolean   @default(true)
+  includeSubtags    Boolean   @default(true)
+  userIds           String[]  @default([]) // grant: למי ניתנה הגישה; restrict: על מי חל (ריק=כולם)
+  deviceId          String? // תנאי: נעילה למכשיר
+  expiresAt         DateTime? // תנאי: חלון זמן
+  active            Boolean   @default(true)
+  note              String?
+  createdById       String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  revokedAt         DateTime?
+  revokedById       String?
+
+  @@index([type])
+  @@index([active])
+}
+
+/// פרויקט עריכה (שלב 4.1) — לכל קובץ מקור יכול להיות פרויקט עריכה, המכיל גרסאות.
+/// העריכה אינה הרסנית: המקור (fileId) לעולם לא משתנה; כל גרסה היא קובץ נגזר חדש (source='edit').
+model MediaEdit {
+  id          String             @id @default(uuid())
+  fileId      String // קובץ המקור (נקרא בלבד — אף פעם לא נכתב)
+  name        String             @default("עריכה")
+  createdById String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+  deletedAt   DateTime?
+  versions    MediaEditVersion[]
+
+  @@index([fileId])
+}
+
+/// גרסת עריכה (שלב 4.1) — שומרת "מתכון" (רשימת פעולות) ואת ה-File הנגזר שנוצר מהחלתו על המקור.
+model MediaEditVersion {
+  id           String    @id @default(uuid())
+  editId       String
+  edit         MediaEdit @relation(fields: [editId], references: [id])
+  versionNo    Int // מספר רץ בתוך הפרויקט (גרסה 1, 2, ...)
+  label        String?
+  recipe       Json // המתכון: רשימת הפעולות שבוצעו (חיתוך/סיבוב/התאמות...)
+  resultFileId String // ה-File הנגזר שנוצר (source='edit')
+  createdById  String?
+  createdAt    DateTime  @default(now())
+
+  @@index([editId])
+}
+
+/// משימת עיבוד ברקע (שלב 4.5) — עבודות כבדות (עריכת תמונה כעת; וידאו ו-AI ב-4.6/4.7) רצות בתור ולא תוקעות את האתר.
+/// ללא קשרי Prisma (מזהים מאונדקסים) — מיגרציה תוספתית בלבד.
+model RenderJob {
+  id           String    @id @default(uuid())
+  type         String // edit (כעת) | video | ai (עתידי)
+  status       String    @default("pending") // pending | processing | done | failed | canceled
+  fileId       String? // קובץ המקור
+  params       Json // פרמטרים (recipe, label, ...)
+  progress     Int       @default(0) // 0..100
+  resultFileId String? // הקובץ הנגזר שנוצר
+  error        String?
+  createdById  String?
+  startedAt    DateTime?
+  finishedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([status])
+  @@index([createdById])
+  @@index([createdAt])
+}

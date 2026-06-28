@@ -1,0 +1,23 @@
+# סודות — אף פעם לא נשמרים ב-Git
+.env
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Builds
+dist/
+.next/
+out/
+build/
+
+# Prisma (קבצים מקומיים)
+*.db
+*.db-journal
+
+# מערכת הפעלה / כלים
+.DS_Store
+Thumbs.db
+*.log
+coverage/

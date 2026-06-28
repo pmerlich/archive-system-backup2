@@ -1,0 +1,103 @@
+# docker-compose.yml — מגדיר את כל "הקופסאות" (קונטיינרים) של המערכת.
+# הרצה מהתיקייה הזו:  docker compose up --build
+# כל הערכים (פורטים, סיסמאות) נלקחים מקובץ .env — לא משכפלים אותם כאן.
+
+services:
+  # מסד הנתונים
+  postgres:
+    image: postgres:16-alpine
+    container_name: archive_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # תורים וזיכרון מטמון
+  redis:
+    image: redis:7-alpine
+    container_name: archive_redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # השרת (NestJS)
+  backend:
+    build: ./backend
+    container_name: archive_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: ${NODE_ENV}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://redis:6379
+      BACKEND_PORT: ${BACKEND_PORT}
+      JWT_SECRET: ${JWT_SECRET}
+      MAIL_HOST: mailpit
+      MAIL_PORT: "1025"
+      MAIL_FROM: "מערכת ארכיון <no-reply@archive.local>"
+      # נתיב אחסון הקבצים (מקור הארכיון) — בתוך volume קבוע, מחוץ לקוד
+      STORAGE_DIR: /data
+    ports:
+      - "${BACKEND_PORT}:${BACKEND_PORT}"
+    volumes:
+      - ./backend:/app
+      - /app/node_modules
+      # אחסון קבצי המקור — volume קבוע (לא נמחק עם הקונטיינר, לא בגיט)
+      - archive_data:/data
+
+  # האתר (Next.js)
+  frontend:
+    build: ./frontend
+    container_name: archive_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:${BACKEND_PORT}
+    ports:
+      - "${FRONTEND_PORT}:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+
+  # כלי לצפייה במסד הנתונים מהדפדפן
+  adminer:
+    image: adminer:latest
+    container_name: archive_adminer
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "${ADMINER_PORT}:8080"
+
+  # תופס מיילים בפיתוח (במקום לשלוח באמת); צפייה בדפדפן: http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: archive_mailpit
+    restart: unless-stopped
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+
+volumes:
+  postgres_data:
+  archive_data:
